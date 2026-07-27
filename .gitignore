@@ -1,0 +1,37 @@
+.DS_Store
+Thumbs.db
+
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Local environment and secrets
+.env
+.env.*
+
+# Editor and IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local runtime output
+*.log
