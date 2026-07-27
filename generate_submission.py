@@ -1,4 +1,5 @@
 import os
+import time
 import json
 from pathlib import Path
 import bot
@@ -43,6 +44,9 @@ for idx, pair in enumerate(test_pairs):
             
     # Compose message using bot's compose function
     res = bot.compose(category, merchant, trigger, customer)
+    
+    # Pause 3.5s between requests to stay under Google AI Studio 15 RPM free tier limit
+    time.sleep(3.5)
     
     # Format according to submission schema
     submission_entry = {

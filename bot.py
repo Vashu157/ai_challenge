@@ -141,7 +141,8 @@ def call_llm(prompt: str, system_prompt: str) -> str:
     groq_key = os.environ.get("GROQ_API_KEY") or os.environ.get("GROQ_LLM_KEY")
 
     if gemini_key:
-        for model in ["gemini-2.5-flash", "gemini-1.5-flash"]:
+        # Valid Google AI Studio model endpoints
+        for model in ["gemini-2.0-flash", "gemini-1.5-flash-latest", "gemini-2.0-flash-exp", "gemini-1.5-pro-latest"]:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={gemini_key}"
             body = {
                 "contents": [
@@ -158,21 +159,30 @@ def call_llm(prompt: str, system_prompt: str) -> str:
                     "responseMimeType": "application/json"
                 }
             }
-            try:
-                req = urllib.request.Request(
-                    url,
-                    data=json.dumps(body).encode("utf-8"),
-                    headers={"Content-Type": "application/json"},
-                    method="POST"
-                )
-                with urllib.request.urlopen(req, timeout=12) as resp:
-                    res_data = json.loads(resp.read().decode("utf-8"))
-                    text = res_data["candidates"][0]["content"]["parts"][0]["text"]
-                    if text:
-                        return text
-            except Exception as e:
-                print(f"Gemini error with model {model}: {e}")
-                continue
+            # Backoff retry loop for 429 rate limits
+            for attempt in range(2):
+                try:
+                    req = urllib.request.Request(
+                        url,
+                        data=json.dumps(body).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                        method="POST"
+                    )
+                    with urllib.request.urlopen(req, timeout=12) as resp:
+                        res_data = json.loads(resp.read().decode("utf-8"))
+                        text = res_data["candidates"][0]["content"]["parts"][0]["text"]
+                        if text:
+                            return text
+                except urllib.error.HTTPError as e:
+                    if e.code == 429:
+                        time.sleep(3.0)  # Wait for 15 RPM rate-limit window to ease
+                        if attempt == 0:
+                            continue
+                    print(f"Gemini error with model {model}: {e}")
+                    break
+                except Exception as e:
+                    print(f"Gemini exception with model {model}: {e}")
+                    break
 
     if groq_key:
         url = "https://api.groq.com/openai/v1/chat/completions"
@@ -185,23 +195,31 @@ def call_llm(prompt: str, system_prompt: str) -> str:
             "temperature": 0.0,
             "response_format": {"type": "json_object"}
         }
-        try:
-            req = urllib.request.Request(
-                url,
-                data=json.dumps(body).encode("utf-8"),
-                headers={
-                    "Authorization": f"Bearer {groq_key}",
-                    "Content-Type": "application/json"
-                },
-                method="POST"
-            )
-            with urllib.request.urlopen(req, timeout=12) as resp:
-                res_data = json.loads(resp.read().decode("utf-8"))
-                text = res_data["choices"][0]["message"]["content"]
-                if text:
-                    return text
-        except Exception as e:
-            print(f"Groq error: {e}")
+        for attempt in range(2):
+            try:
+                req = urllib.request.Request(
+                    url,
+                    data=json.dumps(body).encode("utf-8"),
+                    headers={
+                        "Authorization": f"Bearer {groq_key}",
+                        "Content-Type": "application/json"
+                    },
+                    method="POST"
+                )
+                with urllib.request.urlopen(req, timeout=12) as resp:
+                    res_data = json.loads(resp.read().decode("utf-8"))
+                    text = res_data["choices"][0]["message"]["content"]
+                    if text:
+                        return text
+            except urllib.error.HTTPError as e:
+                if e.code in [429, 500, 502, 503, 504] and attempt == 0:
+                    time.sleep(1.5)
+                    continue
+                print(f"Groq error: {e}")
+                break
+            except Exception as e:
+                print(f"Groq exception: {e}")
+                break
 
     # Fallback to Mock
     return get_mock_completion(prompt)
