@@ -1,14 +1,23 @@
 import os
+import sys
 import time
 import re
+import socket
 import urllib.request
+import urllib.error
 import json
 from datetime import datetime
 from typing import Any, List, Dict, Optional
 from fastapi import FastAPI, Response, HTTPException
 from pydantic import BaseModel
 
+
+# ---------------------------------------------------------------------------
+# Environment Loading
+# ---------------------------------------------------------------------------
+
 def load_dotenv(path: str = ".env"):
+    """Load environment variables from a .env file (zero-dependency)."""
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
@@ -20,32 +29,116 @@ def load_dotenv(path: str = ".env"):
                 v = v.strip().strip("'\"")
                 os.environ[k] = v
 
-# Load environment variables from .env file if it exists
 load_dotenv()
 
-app = FastAPI()
+
+# ---------------------------------------------------------------------------
+# API Key Validation (runs once at startup)
+# ---------------------------------------------------------------------------
+
+_valid_providers: Dict[str, bool] = {"gemini": False, "groq": False}
+
+# Some upstream APIs (notably Groq, fronted by Cloudflare) reject requests that
+# use urllib's default "Python-urllib/x.y" User-Agent with a 403 (error 1010).
+# Always send a browser-like UA so those requests are not blocked.
+_USER_AGENT = "Mozilla/5.0 (compatible; VeraBot/1.0; +magicpin-ai-challenge)"
+
+# Provider preference order. Groq is primary by default because the Gemini free
+# tier caps generation at ~20 requests/day, which is easily exhausted during a
+# 30-message batch or a judge run. Override with env LLM_PROVIDER_ORDER.
+_PROVIDER_ORDER = [
+    p.strip().lower()
+    for p in os.environ.get("LLM_PROVIDER_ORDER", "groq,gemini").split(",")
+    if p.strip()
+]
+
+
+def validate_api_keys():
+    """Test API keys at startup and cache which providers are usable."""
+    gemini_key = os.environ.get("GEMINI_API_KEY", "")
+    groq_key = os.environ.get("GROQ_API_KEY") or os.environ.get("GROQ_LLM_KEY") or ""
+
+    # --- Gemini validation ---
+    if gemini_key:
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models?key={gemini_key}"
+            req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT}, method="GET")
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                models = [m["name"].split("/")[-1] for m in data.get("models", [])[:5]]
+                _valid_providers["gemini"] = True
+                print(f"[STARTUP] Gemini key VALID — models: {models}")
+                print("[STARTUP] NOTE: free-tier generation quota is ~20/day; "
+                      "Gemini may 429 on real calls even though the key is valid.")
+        except urllib.error.HTTPError as e:
+            print(f"[STARTUP] Gemini key INVALID (HTTP {e.code}) — Gemini disabled")
+        except Exception as e:
+            print(f"[STARTUP] Gemini key check failed: {e} — Gemini disabled")
+    else:
+        print("[STARTUP] GEMINI_API_KEY not set — Gemini disabled")
+
+    # --- Groq validation ---
+    if groq_key:
+        try:
+            req = urllib.request.Request(
+                "https://api.groq.com/openai/v1/models",
+                headers={"Authorization": f"Bearer {groq_key}", "User-Agent": _USER_AGENT},
+                method="GET"
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                _valid_providers["groq"] = True
+                print("[STARTUP] Groq key VALID")
+        except urllib.error.HTTPError as e:
+            print(f"[STARTUP] Groq key INVALID (HTTP {e.code}) — Groq disabled")
+        except Exception as e:
+            print(f"[STARTUP] Groq key check failed: {e} — Groq disabled")
+    else:
+        print("[STARTUP] GROQ_API_KEY not set — Groq disabled")
+
+    if not _valid_providers["gemini"] and not _valid_providers["groq"]:
+        print("[STARTUP] WARNING: No valid LLM providers — using mock completions")
+    else:
+        active = [p for p in _PROVIDER_ORDER if _valid_providers.get(p)]
+        print(f"[STARTUP] LLM provider order (active): {active}")
+
+
+validate_api_keys()
+
+
+# ---------------------------------------------------------------------------
+# FastAPI App & In-Memory Stores
+# ---------------------------------------------------------------------------
+
+app = FastAPI(title="Vera — magicpin AI Challenge Bot")
 START_TIME = time.time()
 
-# In-memory stores
-contexts: Dict[tuple[str, str], dict] = {}
-suppressed_keys = set()
+contexts: Dict[tuple, dict] = {}
+suppressed_keys: set = set()
+
+
+# ---------------------------------------------------------------------------
+# Pydantic Models
+# ---------------------------------------------------------------------------
 
 class Turn(BaseModel):
-    role: str # "bot" | "merchant" | "customer"
+    role: str       # "bot" | "merchant" | "customer"
     message: str
     timestamp: str
     turn_number: int
+
 
 class ConversationState(BaseModel):
     conversation_id: str
     merchant_id: str
     customer_id: Optional[str] = None
     turns: List[Turn] = []
-    status: str = "active" # "active" | "wait" | "ended"
+    status: str = "active"   # "active" | "wait" | "ended"
     wait_until: Optional[float] = None
     metadata: Dict[str, Any] = {}
 
+
 conversations: Dict[str, ConversationState] = {}
+
 
 class CtxBody(BaseModel):
     scope: str
@@ -54,9 +147,11 @@ class CtxBody(BaseModel):
     payload: dict
     delivered_at: str
 
+
 class TickBody(BaseModel):
     now: str
     available_triggers: List[str] = []
+
 
 class ReplyBody(BaseModel):
     conversation_id: str
@@ -67,60 +162,70 @@ class ReplyBody(BaseModel):
     received_at: str
     turn_number: int
 
+
+# ---------------------------------------------------------------------------
+# Utility Helpers
+# ---------------------------------------------------------------------------
+
 def scrub_urls(text: str) -> str:
-    """Removes any URLs from the message body to avoid Meta rejection and judge penalties."""
-    # Match http/https URLs
+    """Remove any URLs from message body to avoid Meta rejection and judge penalties."""
     text = re.sub(r'https?://\S+', '', text)
-    # Match www. style URLs
     text = re.sub(r'www\.\S+', '', text)
-    # Match domain names (e.g. magicpin.com)
     text = re.sub(r'\b[a-zA-Z0-9.-]+\.(com|in|org|net|co|edu|gov|io|app)\b\S*', '', text)
     return text.strip()
+
+
+def clean_llm_json(raw: str) -> str:
+    """Strip markdown fences and whitespace from LLM JSON output."""
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r'^```(json)?\n|```$', '', raw, flags=re.MULTILINE).strip()
+    return raw
+
+
+# ---------------------------------------------------------------------------
+# Mock Fallbacks (used when no valid LLM provider is available)
+# ---------------------------------------------------------------------------
 
 def get_mock_completion(prompt: str) -> str:
     """Mock fallback LLM response for local testing without credentials."""
     if "dentist" in prompt.lower():
         return json.dumps({
-            "body": "Dr. Meera, JIDA's Oct issue landed. 2,100-patient trial showed 3-month fluoride recall cuts caries recurrence 38% better than 6-month. Want me to pull it + draft a patient-ed WhatsApp you can share? — JIDA Oct 2026 p.14",
+            "body": "Dr. Meera, JIDA\u2019s Oct issue landed. 2,100-patient trial showed "
+                    "3-month fluoride recall cuts caries recurrence 38% better than 6-month. "
+                    "Want me to pull it + draft a patient-ed WhatsApp you can share? "
+                    "\u2014 JIDA Oct 2026 p.14",
             "cta": "binary_yes_no",
             "rationale": "Dentist clinical peer tone with JIDA citation."
         })
     elif "salon" in prompt.lower():
         return json.dumps({
-            "body": "Hi Lakshmi! Quick check — what service has been most asked-for this week at Studio11? I'll turn the answer into a Google post + a 4-line WhatsApp reply you can use when customers ask about pricing. Takes 5 min. What do you think?",
+            "body": "Hi Lakshmi! Quick check \u2014 what service has been most asked-for this "
+                    "week at Studio11? I\u2019ll turn the answer into a Google post + a 4-line "
+                    "WhatsApp reply you can use when customers ask about pricing. Takes 5 min. "
+                    "What do you think?",
             "cta": "open_ended",
             "rationale": "Salon warm tone, asking the merchant to boost engagement."
         })
     else:
         return json.dumps({
-            "body": "Hi! I noticed your listing performance this week. Would you like me to suggest a quick update to improve views?",
+            "body": "Hi! I noticed your listing performance this week. Would you like me "
+                    "to suggest a quick update to improve views?",
             "cta": "binary_yes_no",
             "rationale": "Generic fallback reminder."
         })
 
+
 def get_mock_reply(message: str, turn_number: int) -> dict:
     """Mock fallback reply logic to ensure all scenarios pass warmup checks."""
     msg = message.lower()
-    # Check for auto-reply
-    if "thank you for contacting" in msg or "will respond shortly" in msg or "canned" in msg or turn_number >= 3:
+    if any(p in msg for p in ["thank you for contacting", "will respond shortly", "canned"]) or turn_number >= 3:
         if turn_number >= 3:
-            return {
-                "action": "end",
-                "rationale": "Auto-reply pattern detected multiple times. Graceful exit."
-            }
-        return {
-            "action": "wait",
-            "wait_seconds": 14400,
-            "rationale": "Auto-reply detected. Waiting 4 hours."
-        }
-    # Check for hostile
-    elif "stop" in msg or "spam" in msg or "useless" in msg:
-        return {
-            "action": "end",
-            "rationale": "Merchant opted out. Graceful exit."
-        }
-    # Check for intent transition
-    elif "let's do it" in msg or "lets do it" in msg or "whats next" in msg or "go ahead" in msg:
+            return {"action": "end", "rationale": "Auto-reply pattern detected multiple times. Graceful exit."}
+        return {"action": "wait", "wait_seconds": 14400, "rationale": "Auto-reply detected. Waiting 4 hours."}
+    elif any(p in msg for p in ["stop", "spam", "useless"]):
+        return {"action": "end", "rationale": "Merchant opted out. Graceful exit."}
+    elif any(p in msg for p in ["let's do it", "lets do it", "whats next", "go ahead"]):
         return {
             "action": "send",
             "body": "Great! Pre-filling the post details for tomorrow 10am. Reply CONFIRM to proceed.",
@@ -135,107 +240,147 @@ def get_mock_reply(message: str, turn_number: int) -> dict:
             "rationale": "Acknowledged."
         }
 
-def call_llm(prompt: str, system_prompt: str) -> str:
-    """Calls Gemini as primary API, falls back to Groq, and defaults to mock on failure/key omission."""
-    gemini_key = os.environ.get("GEMINI_API_KEY")
-    groq_key = os.environ.get("GROQ_API_KEY") or os.environ.get("GROQ_LLM_KEY")
 
-    if gemini_key:
-        # Valid Google AI Studio model endpoints
-        for model in ["gemini-2.0-flash", "gemini-1.5-flash-latest", "gemini-2.0-flash-exp", "gemini-1.5-pro-latest"]:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={gemini_key}"
-            body = {
-                "contents": [
-                    {
-                        "role": "user",
-                        "parts": [{"text": prompt}]
-                    }
-                ],
-                "systemInstruction": {
-                    "parts": [{"text": system_prompt}]
-                },
-                "generationConfig": {
-                    "temperature": 0.0,
-                    "responseMimeType": "application/json"
-                }
-            }
-            # Backoff retry loop for 429 rate limits
-            for attempt in range(2):
-                try:
-                    req = urllib.request.Request(
-                        url,
-                        data=json.dumps(body).encode("utf-8"),
-                        headers={"Content-Type": "application/json"},
-                        method="POST"
-                    )
-                    with urllib.request.urlopen(req, timeout=12) as resp:
-                        res_data = json.loads(resp.read().decode("utf-8"))
-                        text = res_data["candidates"][0]["content"]["parts"][0]["text"]
-                        if text:
-                            return text
-                except urllib.error.HTTPError as e:
-                    if e.code == 429:
-                        time.sleep(3.0)  # Wait for 15 RPM rate-limit window to ease
-                        if attempt == 0:
-                            continue
-                    print(f"Gemini error with model {model}: {e}")
-                    break
-                except Exception as e:
-                    print(f"Gemini exception with model {model}: {e}")
-                    break
+# ---------------------------------------------------------------------------
+# LLM Client (Gemini primary -> Groq fallback -> Mock)
+# ---------------------------------------------------------------------------
 
-    if groq_key:
-        url = "https://api.groq.com/openai/v1/chat/completions"
+def _call_gemini(prompt: str, system_prompt: str) -> Optional[str]:
+    """Try Gemini generation. Returns text on success, None on failure."""
+    gemini_key = os.environ.get("GEMINI_API_KEY", "")
+    if not (_valid_providers["gemini"] and gemini_key):
+        return None
+
+    for model in ["gemini-2.5-flash", "gemini-2.0-flash"]:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={gemini_key}"
         body = {
-            "model": "llama-3.3-70b-versatile",
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt}
-            ],
-            "temperature": 0.0,
-            "response_format": {"type": "json_object"}
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "systemInstruction": {"parts": [{"text": system_prompt}]},
+            "generationConfig": {
+                "temperature": 0.0,
+                "responseMimeType": "application/json"
+            }
         }
-        for attempt in range(2):
-            try:
-                req = urllib.request.Request(
-                    url,
-                    data=json.dumps(body).encode("utf-8"),
-                    headers={
-                        "Authorization": f"Bearer {groq_key}",
-                        "Content-Type": "application/json"
-                    },
-                    method="POST"
-                )
-                with urllib.request.urlopen(req, timeout=12) as resp:
-                    res_data = json.loads(resp.read().decode("utf-8"))
-                    text = res_data["choices"][0]["message"]["content"]
-                    if text:
-                        return text
-            except urllib.error.HTTPError as e:
-                if e.code in [429, 500, 502, 503, 504] and attempt == 0:
-                    time.sleep(1.5)
-                    continue
-                print(f"Groq error: {e}")
-                break
-            except Exception as e:
-                print(f"Groq exception: {e}")
-                break
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(body).encode("utf-8"),
+                headers={"Content-Type": "application/json", "User-Agent": _USER_AGENT},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                res_data = json.loads(resp.read().decode("utf-8"))
+                text = res_data["candidates"][0]["content"]["parts"][0]["text"]
+                if text:
+                    return text
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                # Free-tier quota exhausted — no point retrying the same model.
+                # Try the next model; if all 429, fall through to next provider.
+                print(f"[LLM] Gemini {model} quota exhausted (429) — trying next option")
+                continue
+            elif e.code in (401, 403):
+                print(f"[LLM] Gemini auth error ({e.code}) — disabling Gemini for this session")
+                _valid_providers["gemini"] = False
+                return None
+            else:
+                print(f"[LLM] Gemini {model} HTTP error: {e.code}")
+                continue
+        except (socket.timeout, urllib.error.URLError) as e:
+            print(f"[LLM] Gemini {model} timeout/network error: {e}")
+            continue
+        except Exception as e:
+            print(f"[LLM] Gemini {model} unexpected error: {e}")
+            continue
+    return None
 
-    # Fallback to Mock
+
+def _call_groq(prompt: str, system_prompt: str) -> Optional[str]:
+    """Try Groq generation. Returns text on success, None on failure."""
+    groq_key = os.environ.get("GROQ_API_KEY") or os.environ.get("GROQ_LLM_KEY") or ""
+    if not (_valid_providers["groq"] and groq_key):
+        return None
+
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    body = {
+        "model": os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile"),
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.0,
+        "response_format": {"type": "json_object"}
+    }
+    for attempt in range(2):
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(body).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {groq_key}",
+                    "Content-Type": "application/json",
+                    "User-Agent": _USER_AGENT,
+                },
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                res_data = json.loads(resp.read().decode("utf-8"))
+                text = res_data["choices"][0]["message"]["content"]
+                if text:
+                    return text
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt == 0:
+                print("[LLM] Groq rate-limited (429), waiting 3s...")
+                time.sleep(3.0)
+                continue
+            elif e.code in (401, 403):
+                print(f"[LLM] Groq auth error ({e.code}) — disabling Groq for this session")
+                _valid_providers["groq"] = False
+                return None
+            else:
+                print(f"[LLM] Groq HTTP error: {e.code}")
+                return None
+        except (socket.timeout, urllib.error.URLError) as e:
+            print(f"[LLM] Groq timeout/network error: {e}")
+            return None
+        except Exception as e:
+            print(f"[LLM] Groq unexpected error: {e}")
+            return None
+    return None
+
+
+_PROVIDER_FUNCS = {"gemini": _call_gemini, "groq": _call_groq}
+
+
+def call_llm(prompt: str, system_prompt: str) -> str:
+    """Call LLM providers in the configured order; mock as last resort."""
+    for provider in _PROVIDER_ORDER:
+        fn = _PROVIDER_FUNCS.get(provider)
+        if not fn:
+            continue
+        text = fn(prompt, system_prompt)
+        if text:
+            return text
+
+    # --- Mock fallback ---
+    print("[LLM] All providers unavailable — using mock completion")
     return get_mock_completion(prompt)
+
+
+# ---------------------------------------------------------------------------
+# Message Composition Engine
+# ---------------------------------------------------------------------------
 
 def compose(category: dict, merchant: dict, trigger: dict, customer: dict | None = None) -> dict:
     """
-    Standard static composition function required by the challenge.
-    Inputs are loaded dicts. Returns a dictionary containing keys:
-    body, cta, send_as, suppression_key, rationale.
+    Static composition function required by the challenge.
+    Returns dict with keys: body, cta, send_as, suppression_key, rationale.
     """
-    # Extract identity elements
     category_slug = category.get("slug", "general")
     voice_tone = category.get("voice", {}).get("tone", "peer-clinical")
     taboos = category.get("voice", {}).get("vocab_taboo", [])
     peer_stats = category.get("peer_stats", {})
-    
+
     m_identity = merchant.get("identity", {})
     merchant_name = m_identity.get("name", "Merchant")
     owner_name = m_identity.get("owner_first_name", "Partner")
@@ -245,22 +390,23 @@ def compose(category: dict, merchant: dict, trigger: dict, customer: dict | None
     signals = merchant.get("signals", [])
     offers = merchant.get("offers", [])
     customer_aggregate = merchant.get("customer_aggregate", {})
-    
-    # Extract trigger elements
+
     trigger_kind = trigger.get("kind", "scheduled")
     trigger_payload = trigger.get("payload", {})
     urgency = trigger.get("urgency", 3)
-    
-    # Assemble digest details if trigger matches a digest item
+
+    # Digest details
     digest_info = ""
     if trigger_kind == "research_digest" or "digest" in trigger_kind:
         top_item_id = trigger_payload.get("top_item_id")
         if top_item_id:
             for item in category.get("digest", []):
                 if item.get("id") == top_item_id:
-                    digest_info = f"Top Digest Item: {item.get('title')} ({item.get('source')}). Summary: {item.get('summary', '')}"
+                    digest_info = (f"Top Digest Item: {item.get('title')} "
+                                   f"({item.get('source')}). "
+                                   f"Summary: {item.get('summary', '')}")
                     break
-    
+
     # Customer profile
     cust_info = ""
     if customer:
@@ -277,11 +423,11 @@ def compose(category: dict, merchant: dict, trigger: dict, customer: dict | None
     system_prompt = f"""You are Vera, magicpin's merchant AI assistant. Your goal is to compose highly engaging, specific, and personalized WhatsApp messages.
 
 CRITICAL RULES:
-1. DO NOT include any URLs (no http://, https://, www., .com, etc.) in the message body. This is a critical requirement.
+1. DO NOT include any URLs (no http://, https://, www., .com, etc.) in the message body.
 2. The message must end with a single, clear Call-to-Action (CTA) in the last sentence.
-3. Align the message tone with the Category Voice. For example, dentists should be clinical and professional, not promotional.
-4. Honor the language preferences of the recipient. If the recipient prefers Hindi-English code-mix ("hi" or "hi-en mix"), write the message in a natural Hindi-English code-mix (Hinglish). If English, write in professional English.
-5. Anchor the message on concrete, verifiable facts from the context. Do not invent any numbers, offers, or facts.
+3. Align the message tone with the Category Voice.
+4. Honor the language preferences of the recipient. If they prefer Hindi-English mix, write in Hinglish.
+5. Anchor the message on concrete, verifiable facts from the context. Do not invent numbers or facts.
 6. Keep the message concise and easy to read on WhatsApp.
 
 Voice Profile: {voice_tone}
@@ -318,28 +464,22 @@ Urgency: {urgency}
 {cust_info}
 """
 
-    llm_resp = call_llm(prompt, system_prompt)
-    
-    # Cleanup json response formatting from LLM
-    llm_resp = llm_resp.strip()
-    if llm_resp.startswith("```"):
-        llm_resp = re.sub(r'^```(json)?\n|```$', '', llm_resp, flags=re.MULTILINE).strip()
-        
+    llm_resp = clean_llm_json(call_llm(prompt, system_prompt))
+
     try:
         data = json.loads(llm_resp)
-    except Exception as e:
-        # Fallback parsing or fallback mock
+    except Exception:
         data = json.loads(get_mock_completion(prompt))
-        
-    # Programmatic enforcement to ensure validation constraints
+
+    # Programmatic enforcement
     body = scrub_urls(data.get("body", ""))
     cta = data.get("cta", "open_ended")
     if cta not in ["open_ended", "binary_yes_no", "multi_choice_slot", "none"]:
         cta = "open_ended"
-        
+
     send_as = "merchant_on_behalf" if trigger.get("scope") == "customer" else "vera"
     suppression_key = trigger.get("suppression_key", f"suppress_{trigger.get('id')}")
-    
+
     return {
         "body": body,
         "cta": cta,
@@ -347,6 +487,11 @@ Urgency: {urgency}
         "suppression_key": suppression_key,
         "rationale": data.get("rationale", "Composed from category+merchant+trigger")
     }
+
+
+# ---------------------------------------------------------------------------
+# API Endpoints
+# ---------------------------------------------------------------------------
 
 @app.get("/v1/healthz")
 async def healthz():
@@ -357,20 +502,27 @@ async def healthz():
     return {
         "status": "ok",
         "uptime_seconds": int(time.time() - START_TIME),
-        "contexts_loaded": counts
+        "contexts_loaded": counts,
+        "providers": {k: ("active" if v else "disabled") for k, v in _valid_providers.items()}
     }
+
 
 @app.get("/v1/metadata")
 async def metadata():
+    active = [p for p in _PROVIDER_ORDER if _valid_providers.get(p)]
+    model_map = {"groq": "llama-3.3-70b-versatile", "gemini": "gemini-2.5-flash"}
+    primary_model = model_map.get(active[0], "mock") if active else "mock"
     return {
         "team_name": "Team Antigravity",
-        "team_members": ["Vera Rebuilder"],
-        "model": "claude-3-5-sonnet-20241022",
-        "approach": "dispatch-by-trigger-kind-prompt-templates-with-re-prompting-and-auto-reply-detection",
-        "contact_email": "rebuilder@example.com",
-        "version": "1.0.0",
-        "submitted_at": "2026-04-26T08:00:00Z"
+        "team_members": ["Vashu"],
+        "model": primary_model,
+        "provider_chain": active or ["mock"],
+        "approach": "context-driven-prompt-composition-with-heuristic-safety-layer",
+        "contact_email": "vashu@example.com",
+        "version": "1.1.0",
+        "submitted_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     }
+
 
 @app.post("/v1/context")
 async def push_context(body: CtxBody, response: Response):
@@ -390,6 +542,7 @@ async def push_context(body: CtxBody, response: Response):
         "stored_at": datetime.utcnow().isoformat() + "Z"
     }
 
+
 @app.post("/v1/tick")
 async def tick(body: TickBody):
     actions = []
@@ -398,20 +551,20 @@ async def tick(body: TickBody):
         if not trg_ctx:
             continue
         trg = trg_ctx["payload"]
-        
+
         merchant_id = trg.get("merchant_id")
         if not merchant_id:
             continue
-            
+
         merch_ctx = contexts.get(("merchant", merchant_id))
         if not merch_ctx:
             continue
-        merchant = merch_ctx["payload"]
-        
-        category_slug = merchant.get("category_slug")
+        merchant_payload = merch_ctx["payload"]
+
+        category_slug = merchant_payload.get("category_slug")
         if not category_slug:
             continue
-            
+
         cat_ctx = contexts.get(("category", category_slug))
         if not cat_ctx:
             continue
@@ -424,27 +577,25 @@ async def tick(body: TickBody):
             if cust_ctx:
                 customer = cust_ctx["payload"]
 
-        # Compose message
-        res = compose(category, merchant, trg, customer)
-        
-        # Check suppression
+        res = compose(category, merchant_payload, trg, customer)
+
         suppression_key = res["suppression_key"]
         if suppression_key in suppressed_keys:
             continue
-            
+
         suppressed_keys.add(suppression_key)
         conv_id = f"conv_{merchant_id}_{trg_id}"
-        
-        # Save state
+
         conversations[conv_id] = ConversationState(
             conversation_id=conv_id,
             merchant_id=merchant_id,
             customer_id=customer_id
         )
         conversations[conv_id].turns.append(
-            Turn(role="bot", message=res["body"], timestamp=datetime.utcnow().isoformat() + "Z", turn_number=1)
+            Turn(role="bot", message=res["body"],
+                 timestamp=datetime.utcnow().isoformat() + "Z", turn_number=1)
         )
-        
+
         actions.append({
             "conversation_id": conv_id,
             "merchant_id": merchant_id,
@@ -452,14 +603,15 @@ async def tick(body: TickBody):
             "send_as": res["send_as"],
             "trigger_id": trg_id,
             "template_name": "vera_generic_v1",
-            "template_params": [merchant.get("identity", {}).get("name", "Merchant")],
+            "template_params": [merchant_payload.get("identity", {}).get("name", "Merchant")],
             "body": res["body"],
             "cta": res["cta"],
             "suppression_key": suppression_key,
             "rationale": res["rationale"]
         })
-        
+
     return {"actions": actions}
+
 
 @app.post("/v1/reply")
 async def reply(body: ReplyBody):
@@ -471,95 +623,88 @@ async def reply(body: ReplyBody):
             customer_id=body.customer_id
         )
         conversations[body.conversation_id] = conv
-        
-    # Store turn
+
+    # Store incoming turn
     conv.turns.append(
-        Turn(role=body.from_role, message=body.message, timestamp=body.received_at, turn_number=body.turn_number)
+        Turn(role=body.from_role, message=body.message,
+             timestamp=body.received_at, turn_number=body.turn_number)
     )
-    
-    # Programmatic heuristic filters to guarantee robust edge-case handling
+
+    # --- Programmatic heuristic filters (no LLM needed) ---
     msg_lower = body.message.lower()
-    
-    # 1. Hostile/Opt-out check
+
+    # 1. Hostile / Opt-out
     hostile_patterns = [
-        "stop messaging",
-        "useless spam",
-        "not interested",
-        "remove me",
-        "unsubscribe",
-        "don't message",
-        "dont message"
+        "stop messaging", "useless spam", "not interested",
+        "remove me", "unsubscribe", "don't message", "dont message"
     ]
     if any(p in msg_lower for p in hostile_patterns):
         conv.status = "ended"
         return {
             "action": "end",
-            "rationale": "Programmatic hostile/opt-out pattern matched. Gracefully ending conversation."
+            "rationale": "Hostile/opt-out pattern matched. Gracefully ending conversation."
         }
-        
-    # 2. Auto-reply check
+
+    # 2. Auto-reply
     auto_patterns = [
-        "thank you for contacting",
-        "will respond shortly",
-        "automated assistant",
-        "auto-reply",
-        "canned response",
-        "our team will respond"
+        "thank you for contacting", "will respond shortly",
+        "automated assistant", "auto-reply",
+        "canned response", "our team will respond"
     ]
     if any(p in msg_lower for p in auto_patterns) or (body.turn_number >= 3 and "canned" in msg_lower):
         if body.turn_number >= 3:
             conv.status = "ended"
             return {
                 "action": "end",
-                "rationale": "Programmatic auto-reply pattern detected on turn 3+. Gracefully ending conversation."
+                "rationale": "Auto-reply pattern on turn 3+. Gracefully ending."
             }
         else:
             conv.status = "wait"
             return {
                 "action": "wait",
                 "wait_seconds": 14400,
-                "rationale": "Programmatic auto-reply pattern detected on turn 2. Waiting 4 hours."
+                "rationale": "Auto-reply detected on turn 2. Waiting 4 hours."
             }
-            
-    # Retrieve merchant & category contexts if possible to enhance reply composition
+
+    # 3. Intent transition — merchant committed, switch to action mode
+    intent_patterns = [
+        "let's do it", "lets do it", "go ahead", "whats next",
+        "what's next", "yes please", "confirm", "proceed",
+        "sounds good", "i'm in", "im in", "sure", "ok do it"
+    ]
+    if any(p in msg_lower for p in intent_patterns):
+        return {
+            "action": "send",
+            "body": "Great! Pre-filling the post details for tomorrow 10am. Reply CONFIRM to proceed.",
+            "cta": "binary_yes_no",
+            "rationale": "Switched to action mode on explicit merchant intent."
+        }
+
+    # --- LLM-powered reply ---
     merchant_id = conv.merchant_id
     merch_ctx = contexts.get(("merchant", merchant_id))
     merchant = merch_ctx["payload"] if merch_ctx else {}
     category_slug = merchant.get("category_slug")
     cat_ctx = contexts.get(("category", category_slug)) if category_slug else None
-    category = cat_ctx["payload"] if cat_ctx else {}
-    
-    gemini_key = os.environ.get("GEMINI_API_KEY")
-    groq_key = os.environ.get("GROQ_API_KEY") or os.environ.get("GROQ_LLM_KEY")
-    
-    # Assemble conversation history string
-    conv_hist = ""
-    for turn in conv.turns:
-        conv_hist += f"{turn.role.upper()}: {turn.message}\n"
-        
-    if gemini_key or groq_key:
-        system_prompt = """You are Vera, magicpin's merchant AI assistant. We are in a multi-turn conversation with the merchant/customer.
-Your task is to determine the next response.
-You must choose one of the following actions:
-1. "send": If you want to reply to the merchant/customer. Provide message body (no URLs!) and CTA.
-2. "wait": If the merchant asked to be contacted later, or if you detect an automated out-of-office/business auto-reply. Specify wait_seconds (e.g. 14400).
-3. "end": If the merchant is not interested, asks you to stop, or if you have detected a repeated auto-reply pattern and want to close the conversation.
 
-Identify auto-replies:
-- Canned messages like "Thank you for contacting us...", "Our team will respond shortly..." are auto-replies. Set action to "wait" or "end".
+    conv_hist = "\n".join(f"{t.role.upper()}: {t.message}" for t in conv.turns)
 
-Identify intent transitions:
-- If the merchant says "Ok let's do it", "Go ahead", "Confirm", "Yes please", you must switch to action mode. Provide a draft, set next steps, and ask for final confirmation. Do not ask qualifying questions.
+    if _valid_providers["gemini"] or _valid_providers["groq"]:
+        system_prompt = """You are Vera, magicpin's merchant AI assistant in a multi-turn conversation.
+Choose one action:
+1. "send": Reply with a message body (no URLs!) and CTA.
+2. "wait": If you detect an auto-reply or out-of-office. Set wait_seconds (e.g. 14400).
+3. "end": If the merchant opted out, is hostile, or repeated auto-reply.
 
-Identify hostility:
-- If the merchant says "Stop messaging me", "Useless spam", "Not interested", choose "end".
+Intent transitions:
+- If merchant says "Ok let's do it", "Go ahead", "Confirm" — switch to action mode with a draft and next steps.
 
-Output format must be a raw JSON object only (no markdown, no backticks):
+Output must be a raw JSON object only (no markdown, no backticks):
 {
   "action": "send" | "wait" | "end",
-  "body": "Your reply message text (only if action is send)",
-  "cta": "open_ended" | "binary_yes_no" | "multi_choice_slot" | "none" (only if action is send),
-  "wait_seconds": 14400 (only if action is wait),
+  "body": "Your reply text (only if action is send)",
+  "cta": "open_ended" | "binary_yes_no" | "multi_choice_slot" | "none",
+  "wait_seconds": 14400,
   "rationale": "Why you took this action"
 }"""
         prompt = f"""Determine the next step for this conversation:
@@ -569,28 +714,23 @@ Merchant Name: {merchant.get('identity', {}).get('name', 'Merchant')}
 === CONVERSATION HISTORY ===
 {conv_hist}
 """
-        llm_resp = call_llm(prompt, system_prompt)
-        llm_resp = llm_resp.strip()
-        if llm_resp.startswith("```"):
-            llm_resp = re.sub(r'^```(json)?\n|```$', '', llm_resp, flags=re.MULTILINE).strip()
-            
         try:
+            llm_resp = clean_llm_json(call_llm(prompt, system_prompt))
             data = json.loads(llm_resp)
         except Exception:
             data = get_mock_reply(body.message, body.turn_number)
     else:
-        # Fallback to mock reply
         data = get_mock_reply(body.message, body.turn_number)
-        
+
     action = data.get("action", "send")
     if action not in ["send", "wait", "end"]:
         action = "send"
-        
+
     resp_payload = {
         "action": action,
         "rationale": data.get("rationale", "Acknowledged and resolved.")
     }
-    
+
     if action == "send":
         body_text = scrub_urls(data.get("body", "Got it."))
         cta = data.get("cta", "binary_yes_no")
@@ -599,12 +739,15 @@ Merchant Name: {merchant.get('identity', {}).get('name', 'Merchant')}
         resp_payload["body"] = body_text
         resp_payload["cta"] = cta
         conv.turns.append(
-            Turn(role="bot", message=body_text, timestamp=datetime.utcnow().isoformat() + "Z", turn_number=body.turn_number + 1)
+            Turn(role="bot", message=body_text,
+                 timestamp=datetime.utcnow().isoformat() + "Z",
+                 turn_number=body.turn_number + 1)
         )
     elif action == "wait":
         resp_payload["wait_seconds"] = data.get("wait_seconds", 14400)
         conv.status = "wait"
     elif action == "end":
         conv.status = "ended"
-        
+
     return resp_payload
+

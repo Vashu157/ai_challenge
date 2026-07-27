@@ -4,7 +4,8 @@
 
 Our bot implementation follows a robust, hybrid architecture that bridges programmatic heuristics for strict rule compliance with LLM execution for fluid business reasoning:
 
-1. **Lightweight FastAPI Backend**: Implemented with zero-dependency `load_dotenv` for environment parsing, and standard HTTP requests for Gemini and Groq calling, ensuring fast startup and low resource consumption.
+1. **Lightweight FastAPI Backend**: Implemented with zero-dependency `load_dotenv` for environment parsing, and standard HTTP requests for LLM calls, ensuring fast startup and low resource consumption.
+   - **Resilient provider chain**: Providers are tried in a configurable order (`LLM_PROVIDER_ORDER`, default `groq,gemini`) and fall through to a deterministic mock composer if all fail. Groq is primary because the Gemini free tier caps generation at ~20 requests/day, which a 30-message batch or a full judge run exhausts almost immediately (the symptom was every real call returning HTTP 429 even though the key validated fine). All outbound requests send a browser-like `User-Agent`, without which Groq's Cloudflare edge rejects them with a 403 (error 1010). Rate-limit (429) responses are retried with backoff.
 2. **Context-Driven Prompt Assembly**: Formats and sanitizes category voices, derived performance triggers, benchmarks, and active catalog offer contexts directly into LLM system prompts.
 3. **Structured Pydantic State Store**: Persists ongoing conversation histories (`Turn` and `ConversationState`) to handle multi-turn sequences gracefully.
 4. **Heuristics Safety Layer**:

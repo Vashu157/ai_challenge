@@ -1,0 +1,4 @@
+python -m uvicorn bot:app --port 8080
+python test_server.py
+python judge_simulator.py
+python generate_submission.py
