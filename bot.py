@@ -11,10 +11,26 @@ START_TIME = time.time()
 # In-memory stores
 # (scope, context_id) -> {version: int, payload: dict}
 contexts: Dict[tuple[str, str], dict] = {}
-# conversation_id -> list of turns
-conversations: Dict[str, List[dict]] = {}
 # Set of active suppression keys
 suppressed_keys = set()
+
+class Turn(BaseModel):
+    role: str # "bot" | "merchant" | "customer"
+    message: str
+    timestamp: str
+    turn_number: int
+
+class ConversationState(BaseModel):
+    conversation_id: str
+    merchant_id: str
+    customer_id: Optional[str] = None
+    turns: List[Turn] = []
+    status: str = "active" # "active" | "wait" | "ended"
+    wait_until: Optional[float] = None # epoch time when wait ends
+    metadata: Dict[str, Any] = {}
+
+# conversation_id -> ConversationState
+conversations: Dict[str, ConversationState] = {}
 
 class CtxBody(BaseModel):
     scope: str
@@ -51,9 +67,9 @@ async def healthz():
 @app.get("/v1/metadata")
 async def metadata():
     return {
-        "team_name": "Team Vashu",
-        "team_members": ["pogog builder"],
-        "model": "GEMINI-3.5-high",
+        "team_name": "Team Antigravity",
+        "team_members": ["Vera Rebuilder"],
+        "model": "claude-3-5-sonnet-20241022",
         "approach": "dispatch-by-trigger-kind-prompt-templates-with-re-prompting-and-auto-reply-detection",
         "contact_email": "rebuilder@example.com",
         "version": "1.0.0",
@@ -122,9 +138,21 @@ async def tick(body: TickBody):
         
         conv_id = f"conv_{merchant_id}_{trg_id}"
         
+        # Initialize conversation state
+        conversations[conv_id] = ConversationState(
+            conversation_id=conv_id,
+            merchant_id=merchant_id,
+            customer_id=customer_id
+        )
+        
         # Simple default reply template
         m_name = merchant.get("identity", {}).get("name", "Merchant")
         body_text = f"Hi {m_name}, JIDA's Oct issue highlights new clinical research. Would you like to review the 2-minute summary?"
+        
+        # Add bot's first turn to the state
+        conversations[conv_id].turns.append(
+            Turn(role="bot", message=body_text, timestamp=datetime.utcnow().isoformat() + "Z", turn_number=1)
+        )
         
         actions.append({
             "conversation_id": conv_id,
@@ -144,18 +172,33 @@ async def tick(body: TickBody):
 
 @app.post("/v1/reply")
 async def reply(body: ReplyBody):
-    # Store turn
-    conversations.setdefault(body.conversation_id, []).append({
-        "from": body.from_role,
-        "msg": body.message,
-        "ts": body.received_at,
-        "turn": body.turn_number
-    })
+    # Retrieve or create conversation state
+    conv = conversations.get(body.conversation_id)
+    if not conv:
+        # Fallback to create state if it started on the fly
+        conv = ConversationState(
+            conversation_id=body.conversation_id,
+            merchant_id=body.merchant_id or "unknown",
+            customer_id=body.customer_id
+        )
+        conversations[body.conversation_id] = conv
+        
+    # Store incoming turn
+    conv.turns.append(
+        Turn(role=body.from_role, message=body.message, timestamp=body.received_at, turn_number=body.turn_number)
+    )
     
     # Return simple baseline acknowledgment for Phase 1
+    reply_body = "Got it, I will prepare the abstract details for you. Should I send them over WhatsApp now?"
+    
+    # Store bot reply turn
+    conv.turns.append(
+        Turn(role="bot", message=reply_body, timestamp=datetime.utcnow().isoformat() + "Z", turn_number=body.turn_number + 1)
+    )
+    
     return {
         "action": "send",
-        "body": "Got it, I will prepare the abstract details for you. Should I send them over WhatsApp now?",
+        "body": reply_body,
         "cta": "binary_yes_no",
         "rationale": "Acknowledging the input and presenting a next-best-step binary CTA."
     }

@@ -23,11 +23,11 @@ Author: magicpin AI Challenge Team
 # Your bot's URL (where your bot is running)
 BOT_URL = "http://localhost:8080"
 
-# Choose your LLM provider: "openai", "anthropic", "gemini", "deepseek", "groq", "ollama", "openrouter"
-LLM_PROVIDER = "openai"
+# Choose your LLM provider: "openai", "anthropic", "gemini", "deepseek", "groq", "ollama", "openrouter", "mock"
+LLM_PROVIDER = "mock"
 
 # Your API key (paste your key here)
-LLM_API_KEY = ""  # <-- PUT YOUR API KEY HERE
+LLM_API_KEY = "mock"  # <-- PUT YOUR API KEY HERE
 
 # Model to use (leave empty for default, or specify like "gpt-4o", "claude-3-5-sonnet-20241022", etc.)
 LLM_MODEL = ""  # <-- Optional: specify model or leave empty for default
@@ -325,6 +325,28 @@ class OpenRouterProvider(LLMProvider):
         return data["choices"][0]["message"]["content"]
 
 
+class MockProvider(LLMProvider):
+    def name(self) -> str:
+        return "Mock LLM Provider"
+
+    def complete(self, prompt: str, system: str = None) -> str:
+        if "ready" in prompt.lower():
+            return "ready"
+        return json.dumps({
+            "specificity": 8,
+            "specificity_reason": "Good specificity",
+            "category_fit": 8,
+            "category_fit_reason": "Good category fit",
+            "merchant_fit": 8,
+            "merchant_fit_reason": "Good merchant fit",
+            "decision_quality": 8,
+            "decision_quality_reason": "Good decision quality",
+            "engagement_compulsion": 8,
+            "engagement_reason": "Good engagement",
+            "hint": "None"
+        })
+
+
 def create_provider() -> LLMProvider:
     """Create LLM provider from configuration."""
     providers = {
@@ -335,6 +357,7 @@ def create_provider() -> LLMProvider:
         "groq": lambda: GroqProvider(LLM_API_KEY, LLM_MODEL),
         "ollama": lambda: OllamaProvider(LLM_MODEL, OLLAMA_URL),
         "openrouter": lambda: OpenRouterProvider(LLM_API_KEY, LLM_MODEL),
+        "mock": lambda: MockProvider(),
     }
 
     if LLM_PROVIDER not in providers:
