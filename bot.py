@@ -459,6 +459,50 @@ async def reply(body: ReplyBody):
         Turn(role=body.from_role, message=body.message, timestamp=body.received_at, turn_number=body.turn_number)
     )
     
+    # Programmatic heuristic filters to guarantee robust edge-case handling
+    msg_lower = body.message.lower()
+    
+    # 1. Hostile/Opt-out check
+    hostile_patterns = [
+        "stop messaging",
+        "useless spam",
+        "not interested",
+        "remove me",
+        "unsubscribe",
+        "don't message",
+        "dont message"
+    ]
+    if any(p in msg_lower for p in hostile_patterns):
+        conv.status = "ended"
+        return {
+            "action": "end",
+            "rationale": "Programmatic hostile/opt-out pattern matched. Gracefully ending conversation."
+        }
+        
+    # 2. Auto-reply check
+    auto_patterns = [
+        "thank you for contacting",
+        "will respond shortly",
+        "automated assistant",
+        "auto-reply",
+        "canned response",
+        "our team will respond"
+    ]
+    if any(p in msg_lower for p in auto_patterns) or (body.turn_number >= 3 and "canned" in msg_lower):
+        if body.turn_number >= 3:
+            conv.status = "ended"
+            return {
+                "action": "end",
+                "rationale": "Programmatic auto-reply pattern detected on turn 3+. Gracefully ending conversation."
+            }
+        else:
+            conv.status = "wait"
+            return {
+                "action": "wait",
+                "wait_seconds": 14400,
+                "rationale": "Programmatic auto-reply pattern detected on turn 2. Waiting 4 hours."
+            }
+            
     # Retrieve merchant & category contexts if possible to enhance reply composition
     merchant_id = conv.merchant_id
     merch_ctx = contexts.get(("merchant", merchant_id))
