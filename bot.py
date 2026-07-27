@@ -510,12 +510,10 @@ async def healthz():
 @app.get("/v1/metadata")
 async def metadata():
     active = [p for p in _PROVIDER_ORDER if _valid_providers.get(p)]
-    model_map = {"groq": "llama-3.3-70b-versatile", "gemini": "gemini-2.5-flash"}
-    primary_model = model_map.get(active[0], "mock") if active else "mock"
     return {
-        "team_name": "Team Antigravity",
+        "team_name": "Vashu's team",
         "team_members": ["Vashu"],
-        "model": primary_model,
+        "model": "gemini-2.5-flash",
         "provider_chain": active or ["mock"],
         "approach": "context-driven-prompt-composition-with-heuristic-safety-layer",
         "contact_email": "vashu@example.com",
