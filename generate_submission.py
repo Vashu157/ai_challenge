@@ -67,8 +67,8 @@ for idx, pair in enumerate(test_pairs):
         failed.append(test_id)
 
     # Rate-limit pacing: Groq free tier has strict token-per-minute limits.
-    # With rich prompts (~1500 tokens each), we need ~6s gaps to stay under the TPM cap.
-    time.sleep(6.0)
+    # With rich prompts (~1500 tokens each), we need ~15s gaps to stay under the TPM cap.
+    time.sleep(15.0)
 
 # Write output
 print(f"\nWriting {len(lines)} entries to {output_path}")

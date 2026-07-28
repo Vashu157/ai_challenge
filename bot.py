@@ -6,7 +6,7 @@ import socket
 import urllib.request
 import urllib.error
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, List, Dict, Optional
 from fastapi import FastAPI, Response, HTTPException
 from pydantic import BaseModel
@@ -175,6 +175,16 @@ def scrub_urls(text: str) -> str:
     return text.strip()
 
 
+def scrub_boilerplate(text: str) -> str:
+    """Remove leaked template placeholders and boilerplate from LLM output."""
+    text = re.sub(r'[Aa]apke liye 2 slots ready hain[\s.—\-,]*', '', text)
+    text = re.sub(r'\bN\s+merchants?\b', 'merchants', text)
+    text = re.sub(r'\bN\s+\d+\s+merchants?\b', lambda m: m.group().replace('N ', ''), text)
+    text = re.sub(r'(?:save|saving)\s*₹\s*0[,.]?0+', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\s{2,}', ' ', text)
+    return text.strip()
+
+
 def clean_llm_json(raw: str) -> str:
     """Strip markdown fences and whitespace from LLM JSON output."""
     raw = raw.strip()
@@ -189,30 +199,62 @@ def clean_llm_json(raw: str) -> str:
 
 def get_mock_completion(prompt: str) -> str:
     """Mock fallback LLM response for local testing without credentials."""
-    if "dentist" in prompt.lower():
+    prompt_lower = prompt.lower()
+
+    owner_match = re.search(r'Owner First Name:\s*(\S+)', prompt)
+    owner = owner_match.group(1) if owner_match else "Partner"
+
+    biz_match = re.search(r'Business Name:\s*(.+)', prompt)
+    biz = biz_match.group(1).strip() if biz_match else "your business"
+
+    if "dentist" in prompt_lower:
         return json.dumps({
-            "body": "Dr. Meera, JIDA\u2019s Oct issue landed. 2,100-patient trial showed "
-                    "3-month fluoride recall cuts caries recurrence 38% better than 6-month. "
-                    "Want me to pull it + draft a patient-ed WhatsApp you can share? "
-                    "\u2014 JIDA Oct 2026 p.14",
-            "cta": "binary_yes_no",
-            "rationale": "Dentist clinical peer tone with JIDA citation."
+            "body": f"Dr. {owner}, aapke clinic ka CTR peer median se neeche hai. "
+                    f"JIDA Oct 2026 (p.14) ke ek 2,100-patient trial ke mutabiq, "
+                    f"3-month fluoride recall caries recurrence 38% better cut karta hai. "
+                    f"Want me to draft a patient-ed WhatsApp you can share?",
+            "cta": "open_ended",
+            "rationale": "Dentist clinical peer tone with JIDA citation and peer comparison."
         })
-    elif "salon" in prompt.lower():
+    elif "salon" in prompt_lower:
         return json.dumps({
-            "body": "Hi Lakshmi! Quick check \u2014 what service has been most asked-for this "
-                    "week at Studio11? I\u2019ll turn the answer into a Google post + a 4-line "
-                    "WhatsApp reply you can use when customers ask about pricing. Takes 5 min. "
-                    "What do you think?",
+            "body": f"Hi {owner}! Quick check \u2014 {biz} mein is week kaunsi service "
+                    f"sabse zyada demand mein hai? Main aapka jawab sunke ek Google post "
+                    f"+ WhatsApp reply template bana sakti hoon. 5 min ka kaam hai.",
             "cta": "open_ended",
             "rationale": "Salon warm tone, asking the merchant to boost engagement."
         })
+    elif "gym" in prompt_lower:
+        return json.dumps({
+            "body": f"Hi {owner}, {biz} ka performance check kiya. "
+                    f"Aapke members ke liye koi naya program ya class add karne ka plan hai? "
+                    f"Main ek draft bana sakti hoon \u2014 just say go.",
+            "cta": "open_ended",
+            "rationale": "Gym coaching tone with effort externalization."
+        })
+    elif "pharma" in prompt_lower:
+        return json.dumps({
+            "body": f"Hi {owner}, {biz} ki recent performance review ki. "
+                    f"Kya aapne seasonal stock adjustments kiye hain? "
+                    f"Main ek checklist ready kar sakti hoon \u2014 want to see it?",
+            "cta": "binary_yes_no",
+            "rationale": "Pharmacy trustworthy tone with seasonal relevance."
+        })
+    elif "restaurant" in prompt_lower:
+        return json.dumps({
+            "body": f"Hi {owner}, {biz} ka profile check kiya. "
+                    f"Aapke active offers ko highlight karke footfall badhane ka plan hai \u2014 "
+                    f"main ek draft campaign bana sakti hoon. Want the breakdown?",
+            "cta": "open_ended",
+            "rationale": "Restaurant operator tone with effort externalization."
+        })
     else:
         return json.dumps({
-            "body": "Hi! I noticed your listing performance this week. Would you like me "
-                    "to suggest a quick update to improve views?",
+            "body": f"Hi {owner}, {biz} ki listing performance review ki. "
+                    f"Kuch updates suggest kar sakti hoon jo views improve kar sakte hain. "
+                    f"Want to see the suggestions?",
             "cta": "binary_yes_no",
-            "rationale": "Generic fallback reminder."
+            "rationale": "Fallback with reciprocity and curiosity."
         })
 
 
@@ -228,7 +270,7 @@ def get_mock_reply(message: str, turn_number: int) -> dict:
     elif any(p in msg for p in ["let's do it", "lets do it", "whats next", "go ahead"]):
         return {
             "action": "send",
-            "body": "Great! Pre-filling the post details for tomorrow 10am. Reply CONFIRM to proceed.",
+            "body": "Done! Setting this up for you now. I'll send you a confirmation once it's ready. Reply CONFIRM to proceed.",
             "cta": "binary_yes_no",
             "rationale": "Switched to action mode on explicit intent."
         }
@@ -311,7 +353,7 @@ def _call_groq(prompt: str, system_prompt: str) -> Optional[str]:
         "temperature": 0.0,
         "response_format": {"type": "json_object"}
     }
-    for attempt in range(3):
+    for attempt in range(2):
         try:
             req = urllib.request.Request(
                 url,
@@ -329,9 +371,9 @@ def _call_groq(prompt: str, system_prompt: str) -> Optional[str]:
                 if text:
                     return text
         except urllib.error.HTTPError as e:
-            if e.code == 429 and attempt < 2:
-                wait = 5 * (attempt + 1)
-                print(f"[LLM] Groq rate-limited (429), waiting {wait}s (attempt {attempt+1}/3)...")
+            if e.code == 429 and attempt < 1:
+                wait = 8
+                print(f"[LLM] Groq rate-limited (429), waiting {wait}s (attempt {attempt+1}/2)...")
                 time.sleep(wait)
                 continue
             elif e.code in (401, 403):
@@ -569,6 +611,8 @@ def _extract_context_fields(category: dict, merchant: dict, trigger: dict, custo
     seasonal = category.get("seasonal_beats", [])
     trends = category.get("trend_signals", [])
 
+    is_placeholder = trigger_payload.get("placeholder", False) is True
+
     return {
         "category_slug": category.get("slug", "general"),
         "voice_tone": voice.get("tone", "peer"),
@@ -598,6 +642,7 @@ def _extract_context_fields(category: dict, merchant: dict, trigger: dict, custo
         "urgency": trigger.get("urgency", 3),
         "customer_block": cust_block,
         "is_customer_facing": trigger.get("scope") == "customer" or customer is not None,
+        "is_placeholder_trigger": is_placeholder,
     }
 
 
@@ -615,7 +660,7 @@ def compose(category: dict, merchant: dict, trigger: dict, customer: dict | None
     # Language instruction
     lang_list = ctx["languages"]
     if "hi" in lang_list and "en" in lang_list:
-        lang_instruction = "Write in Hindi-English mix (Hinglish) — natural code-switching like 'Aapke liye 2 slots ready hain'."
+        lang_instruction = "Write in Hindi-English mix (Hinglish) — natural code-switching, e.g. 'Aapka profile check kiya'."
     elif "hi" in lang_list:
         lang_instruction = "Write in Hindi (Devanagari acceptable but Roman Hindi is preferred for WhatsApp readability)."
     else:
@@ -640,16 +685,32 @@ def compose(category: dict, merchant: dict, trigger: dict, customer: dict | None
             "Address the owner by first name."
         )
 
+    # Anti-fabrication guard for placeholder triggers
+    placeholder_warning = ""
+    if ctx["is_placeholder_trigger"]:
+        placeholder_warning = (
+            "\n=== CRITICAL: PLACEHOLDER TRIGGER ===\n"
+            "The trigger payload has NO specific data (it is a placeholder). "
+            "You MUST compose ONLY from the merchant's performance, offers, signals, and category context. "
+            "Do NOT invent festival names, dates, competitor names, specific percentages, "
+            "appointment times, medication names, or any other details not present in the context below. "
+            "If the trigger kind implies data you don't have (e.g. appointment_tomorrow but no time given), "
+            "use ONLY what is available from the merchant/category context and keep the message general "
+            "for that trigger type.\n"
+        )
+
     system_prompt = f"""You are Vera, magicpin's merchant AI assistant for Indian local commerce.
 
 === HARD RULES (violating these = score penalty) ===
 1. NEVER include URLs (no http://, https://, www., .com, .in, .org) in the message body. Penalty: -3 per URL.
-2. NEVER fabricate data not present in the context. No invented numbers, papers, competitor names, or offers.
+2. NEVER fabricate data not present in the context below. No invented numbers, papers, competitor names, or offers. If a number or fact is not explicitly present in the context, DO NOT include it.
 3. The CTA (call-to-action) MUST be in the LAST sentence. Only ONE primary CTA per message.
 4. NEVER use generic phrases like "Flat 30% off", "increase your sales", "boost your business".
 5. NEVER start with long preambles like "I hope you're doing well" or "I'm reaching out today to".
 6. Keep the message concise — 3-6 sentences max for WhatsApp readability.
-
+7. NEVER use placeholder text like "N merchants", "X%", or "2 slots ready hain" unless the actual number or slot data is in the context. Replace with real data from the context, or omit the claim entirely.
+8. Only mention appointment slots, available times, or "slots ready" if SPECIFIC slot data is present in the trigger payload or customer context. If no slots are provided, do not mention slots at all.
+{placeholder_warning}
 === VOICE PROFILE ===
 Category: {ctx['category_slug']}
 Tone: {ctx['voice_tone']} | Register: {ctx['voice_register']}
@@ -665,11 +726,11 @@ Tone examples (mimic this style): {ctx['tone_examples'][:3]}
 {audience_note}
 
 === COMPULSION LEVERS (use at least 2 per message) ===
-1. SPECIFICITY: Concrete numbers, dates, source citations from the context
-2. LOSS AVERSION: "you're missing X" / "before this window closes" / frame as what they lose by not acting
-3. SOCIAL PROOF: "N merchants in your locality did Y" / peer benchmark comparison
+1. SPECIFICITY: Concrete numbers, dates, source citations ONLY from the context provided
+2. LOSS AVERSION: Frame as what they lose by not acting, using real data
+3. SOCIAL PROOF: Use peer_stats benchmarks from category context (avg_rating, avg_ctr, etc.) — cite the actual numbers, never "N merchants"
 4. EFFORT EXTERNALIZATION: "I've drafted X — just say go" / "5-min setup, I'll handle the rest"
-5. CURIOSITY: "want to see who?" / "want the full breakdown?"
+5. CURIOSITY: "want to see the breakdown?" / "want to know how you compare?"
 6. RECIPROCITY: "I noticed Y about your account" / "I pulled this for you"
 7. ASKING THE MERCHANT: Ask them a question about their business (most underused, highest engagement)
 8. SINGLE BINARY COMMITMENT: Reply YES/STOP, not multi-choice menus
@@ -723,7 +784,7 @@ Urgency: {ctx['urgency']}/5
         data = json.loads(get_mock_completion(prompt))
 
     # Programmatic enforcement
-    body = scrub_urls(data.get("body", ""))
+    body = scrub_boilerplate(scrub_urls(data.get("body", "")))
     cta = data.get("cta", "open_ended")
     if cta not in ["open_ended", "binary_yes_no", "multi_choice_slot", "none"]:
         cta = "open_ended"
@@ -762,19 +823,27 @@ async def healthz():
 async def metadata():
     active = [p for p in _PROVIDER_ORDER if _valid_providers.get(p)]
     return {
-        "team_name": "Vashu's team",
+        "team_name": "Team Antigravity",
         "team_members": ["Vashu"],
         "model": "gemini-2.5-flash",
         "provider_chain": active or ["mock"],
         "approach": "context-driven-prompt-composition-with-heuristic-safety-layer",
         "contact_email": "vashu@example.com",
         "version": "1.1.0",
-        "submitted_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        "submitted_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     }
 
 
 @app.post("/v1/context")
 async def push_context(body: CtxBody, response: Response):
+    valid_scopes = {"category", "merchant", "customer", "trigger"}
+    if body.scope not in valid_scopes:
+        response.status_code = 400
+        return {
+            "accepted": False,
+            "reason": "invalid_scope",
+            "details": f"Scope must be one of {sorted(valid_scopes)}, got '{body.scope}'"
+        }
     key = (body.scope, body.context_id)
     cur = contexts.get(key)
     if cur and cur["version"] >= body.version:
@@ -788,7 +857,7 @@ async def push_context(body: CtxBody, response: Response):
     return {
         "accepted": True,
         "ack_id": f"ack_{body.context_id}_v{body.version}",
-        "stored_at": datetime.utcnow().isoformat() + "Z"
+        "stored_at": datetime.now(timezone.utc).isoformat() + "Z"
     }
 
 
@@ -842,7 +911,7 @@ async def tick(body: TickBody):
         )
         conversations[conv_id].turns.append(
             Turn(role="bot", message=res["body"],
-                 timestamp=datetime.utcnow().isoformat() + "Z", turn_number=1)
+                 timestamp=datetime.now(timezone.utc).isoformat() + "Z", turn_number=1)
         )
 
         actions.append({
@@ -879,6 +948,10 @@ async def reply(body: ReplyBody):
              timestamp=body.received_at, turn_number=body.turn_number)
     )
 
+    # Resolve merchant context early (needed by both heuristics and LLM path)
+    merchant_id = conv.merchant_id
+    merch_ctx = contexts.get(("merchant", merchant_id))
+
     # --- Programmatic heuristic filters (no LLM needed) ---
     msg_lower = body.message.lower()
 
@@ -897,15 +970,16 @@ async def reply(body: ReplyBody):
     # 2. Auto-reply
     auto_patterns = [
         "thank you for contacting", "will respond shortly",
-        "automated assistant", "auto-reply",
+        "automated assistant", "auto-reply", "automated",
+        "out-of-office", "out of office",
         "canned response", "our team will respond"
     ]
-    if any(p in msg_lower for p in auto_patterns) or (body.turn_number >= 3 and "canned" in msg_lower):
-        if body.turn_number >= 3:
+    if any(p in msg_lower for p in auto_patterns) or (body.turn_number >= 3 and (conv.status == "wait" or "canned" in msg_lower)):
+        if body.turn_number >= 3 or conv.status == "wait":
             conv.status = "ended"
             return {
                 "action": "end",
-                "rationale": "Auto-reply pattern on turn 3+. Gracefully ending."
+                "rationale": "Auto-reply pattern on turn 3+ or follow-up after wait. Gracefully ending."
             }
         else:
             conv.status = "wait"
@@ -922,16 +996,34 @@ async def reply(body: ReplyBody):
         "sounds good", "i'm in", "im in", "sure", "ok do it"
     ]
     if any(p in msg_lower for p in intent_patterns):
+        merchant_name = "there"
+        if merch_ctx and merch_ctx.get("payload"):
+            m_id = merch_ctx["payload"].get("identity", {})
+            merchant_name = m_id.get("owner_first_name", m_id.get("name", "there"))
+
+        prev_topic = ""
+        for t in reversed(conv.turns):
+            if t.role == "bot" and t.message:
+                prev_topic = t.message[:80]
+                break
+
+        action_body = (
+            f"Done, {merchant_name}! Setting this up for you now. "
+            f"I'll send you a confirmation once it's ready. Reply CONFIRM to proceed."
+        )
+        if prev_topic:
+            action_body = (
+                f"Great, {merchant_name}! Proceeding with the next steps. "
+                f"I'll have the details ready shortly. Reply CONFIRM to finalize."
+            )
         return {
             "action": "send",
-            "body": "Great! Pre-filling the post details for tomorrow 10am. Reply CONFIRM to proceed.",
+            "body": scrub_boilerplate(action_body),
             "cta": "binary_yes_no",
             "rationale": "Switched to action mode on explicit merchant intent."
         }
 
     # --- LLM-powered reply ---
-    merchant_id = conv.merchant_id
-    merch_ctx = contexts.get(("merchant", merchant_id))
     merchant = merch_ctx["payload"] if merch_ctx else {}
     category_slug = merchant.get("category_slug")
     cat_ctx = contexts.get(("category", category_slug)) if category_slug else None
@@ -981,7 +1073,7 @@ Merchant Name: {merchant.get('identity', {}).get('name', 'Merchant')}
     }
 
     if action == "send":
-        body_text = scrub_urls(data.get("body", "Got it."))
+        body_text = scrub_boilerplate(scrub_urls(data.get("body", "Got it.")))
         cta = data.get("cta", "binary_yes_no")
         if cta not in ["open_ended", "binary_yes_no", "multi_choice_slot", "none"]:
             cta = "binary_yes_no"
@@ -989,7 +1081,7 @@ Merchant Name: {merchant.get('identity', {}).get('name', 'Merchant')}
         resp_payload["cta"] = cta
         conv.turns.append(
             Turn(role="bot", message=body_text,
-                 timestamp=datetime.utcnow().isoformat() + "Z",
+                 timestamp=datetime.now(timezone.utc).isoformat() + "Z",
                  turn_number=body.turn_number + 1)
         )
     elif action == "wait":
